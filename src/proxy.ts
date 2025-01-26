@@ -26,9 +26,23 @@ import { LoginResultType } from './plugins'
 // Bun.ArrayBufferSink 的内部缓冲区大小
 const highWaterMark = 64 * 1024 // 64 KiB
 
-// 是否使用微任务队列转发数据包
-// 若为否，每次数据包到达时直接尝试刷新缓冲区
-const useMicrotask = true
+class TimeoutManager {
+	private timeouts = new Set<NodeJS.Timer>()
+	
+	setTimeout(callback: () => void, ms: number): NodeJS.Timer {
+		const timeout = setTimeout(() => {
+			this.timeouts.delete(timeout)
+			callback()
+		}, ms)
+		this.timeouts.add(timeout)
+		return timeout
+	}
+
+	clearAll() {
+		this.timeouts.forEach(timeout => clearTimeout(timeout))
+		this.timeouts.clear()
+	}
+}
 
 // Client to relay socket data
 export type C2RSocketData = {
@@ -48,6 +62,7 @@ export type C2RSocketData = {
 	proxyProtocol: boolean | null // 是否启用 Proxy Protocol v2 出站
 	FML: 0 | 1 | 2 | null // 是否为 Forge Mod Loader (2) 客户端，0 代表非 FML
 	timeouts: NodeJS.Timer[] // 存储所有的 timeout
+	timeoutManager: TimeoutManager
 }
 
 // Relay to server socket data
@@ -57,13 +72,47 @@ type R2SSocketData = {
 	timeouts: NodeJS.Timer[] // 存储所有的 timeout
 }
 
+// 使用 Set 进行去重
+const pendingFlush = new Set<Bun.Socket<C2RSocketData | R2SSocketData>>()
+
+// 使用对象池复用缓冲区
+const bufferPool = {
+	pool: [] as Buffer[],
+	maxSize: 1000,
+	
+	acquire(size: number): Buffer {
+		const buffer = this.pool.find(b => b.length >= size)
+		if (buffer) {
+			this.pool = this.pool.filter(b => b !== buffer)
+			return buffer
+		}
+		return Buffer.alloc(size)
+	},
+	
+	release(buffer: Buffer) {
+		if (this.pool.length < this.maxSize) {
+			this.pool.push(buffer)
+		}
+	}
+}
+
+// 在写入缓冲区时使用对象池
 const writeToBuffer = (
-	socket: Bun.Socket<C2RSocketData> | Bun.Socket<R2SSocketData>,
+	socket: Bun.Socket<C2RSocketData | R2SSocketData>,
 	buffer: Buffer,
 ) => {
-	socket.data.sendBuffer.write(buffer)
-	if (useMicrotask) queueMicrotask(() => sendBuffer(socket))
-	else sendBuffer(socket)
+	const pooledBuffer = bufferPool.acquire(buffer.length)
+	buffer.copy(pooledBuffer)
+	socket.data.sendBuffer.write(pooledBuffer)
+	
+	if (!pendingFlush.has(socket)) {
+		pendingFlush.add(socket)
+		queueMicrotask(() => {
+			sendBuffer(socket)
+			pendingFlush.delete(socket)
+			bufferPool.release(pooledBuffer)
+		})
+	}
 }
 
 const sendBuffer = (
@@ -238,6 +287,7 @@ export class MinecraftProxy {
 						proxyProtocol: null,
 						FML: null,
 						timeouts: [],
+						timeoutManager: new TimeoutManager(),
 					}
 
 					logger.debug(
@@ -254,8 +304,8 @@ export class MinecraftProxy {
 					if (!this.inbound.proxyProtocol)
 						clientSocket.data.originIP = IP.parse(clientSocket.remoteAddress)
 
-					// 若 3 秒内未成功读取握手包，则断开连接
-					const handshakeTimeout = setTimeout(() => {
+					// 使用新的超时管理器
+					clientSocket.data.timeoutManager.setTimeout(() => {
 						if (clientSocket.data.state === null) {
 							logger.warn(
 								`${colorHash(clientSocket.data.connId)} Handshake timeout`,
@@ -263,7 +313,6 @@ export class MinecraftProxy {
 							clientSocket.end()
 						}
 					}, 3000)
-					clientSocket.data.timeouts.push(handshakeTimeout)
 				},
 				close: async clientSocket => {
 					clientSocket.data.sendBuffer.end()

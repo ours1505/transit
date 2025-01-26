@@ -83,23 +83,30 @@ export const buildPacket = async (
 export class MinecraftPacketStream {
 	private buffer = Buffer.alloc(0)
 	private compressionThreshold = -1
-	private queue: Buffer[] = [] // 队列存储已解析的包
-	private packetPromiseResolver: (() => void) | null = null // 用于异步等待包
+	private queue: Buffer[] = []
+	private packetPromiseResolver: (() => void) | null = null
+	private maxBufferSize = 2097151 // 2^21 - 1 字节，Minecraft 数据包最大长度
+	private maxQueueSize = 1000 // 最大队列长度限制
 
-	// TODO: 用 Result API 实现异常处理
 	async push(chunk: Buffer): Promise<boolean> {
-		this.buffer = Buffer.concat([this.buffer, chunk])
-
-		// 如果 buffer 的大小超过了 2^21 - 1 Bytes（一个 Minecraft 数据包的最大长度）
-		if (this.buffer.length > 2097151) return false
-		else {
-			// 如果 buffer 的大小未达到 2^21 - 1 Bytes，正常处理 buffer
-			try {
-				this.processBuffer()
-			} catch {
-				return false
-			}
+		// 检查缓冲区大小限制
+		if (this.buffer.length + chunk.length > this.maxBufferSize) {
+			return false
 		}
+
+		this.buffer = Buffer.concat([this.buffer, chunk])
+		
+		try {
+			this.processBuffer()
+		} catch {
+			return false
+		}
+		
+		// 检查队列大小限制
+		if (this.queue.length > this.maxQueueSize) {
+			this.queue = this.queue.slice(-this.maxQueueSize)
+		}
+
 		return true
 	}
 
